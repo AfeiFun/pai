@@ -1,0 +1,555 @@
+#!/usr/bin/env bash
+# pai-run — run a delegated job on a pluggable executor model, visible in an Otty split pane.
+#
+# Usage:
+#   pai-run --spec <path> [--cwd <dir>] [--model <alias>] [--timeout <sec>] [--final <path>]
+#   pai-run --wait <job.meta>      # keep waiting on a job (after a stall warning)
+#
+# Exit: 0 receipt succeeded · 1 receipt failed · 3 no visible Otty pane · 4 receipt unreadable /
+#       executor exited without receipt · 124 timeout · 125 stalled
+#
+# Models: --model takes an alias from models.json (default: its "default" field).
+#   Config: $PAI_MODELS_JSON, default ~/.claude/skills/pai/models.json ("disabled": true hides an entry)
+#   "harness" picks the CLI shell that drives the model:
+#     "claude" (default) — Claude Code interactive TUI
+#     "dsh"              — DeepSeek Harness headless profile; its --json event stream is rendered live
+#
+# Behavior:
+#   Must be called from inside an Otty pane (OTTY_PANE_ID set). Splits the caller's pane to the
+#   RIGHT (`otty pane split --direction right --no-focus`) and runs the executor there — left
+#   architect / right executor, same tab. Full output is captured to --final.
+#
+# Env:
+#   PAI_STALL_SEC       — default 300: return 125 when the right pane's screen hasn't changed
+#                          (digits/spinners ignored) for this long and no receipt was written.
+#   PAI_SPLIT_PERCENT   — default 50: the executor pane's share of the split.
+set -euo pipefail
+
+SPEC=""
+CWD="$(pwd)"
+MODEL_ALIAS=""
+TIMEOUT_SEC=1800
+FINAL=""
+TITLE=""
+
+usage() {
+  sed -n '2,27p' "$0" | sed 's/^# \?//'
+  exit 2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --spec) SPEC="${2:-}"; shift 2 ;;
+    --cwd) CWD="${2:-}"; shift 2 ;;
+    --model) MODEL_ALIAS="${2:-}"; shift 2 ;;
+    --timeout) TIMEOUT_SEC="${2:-}"; shift 2 ;;
+    --final) FINAL="${2:-}"; shift 2 ;;
+    --title) TITLE="${2:-}"; shift 2 ;;
+    --wait) WAIT_META="${2:-}"; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "unknown arg: $1" >&2; usage ;;
+  esac
+done
+
+OTTY_CLI="${OTTY_CLI:-/Applications/Otty.app/Contents/MacOS/otty-cli}"
+STALL_SEC="${PAI_STALL_SEC:-300}"
+
+# ---- completion: receipt / stall / report (shared by dispatch and --wait) ----
+
+# Exit code from the executor's receipt: succeeded → 0, failed → 1, unreadable → 4.
+# Retries briefly in case the executor is still writing the file.
+receipt_exit_code() {
+  python3 -I - "$RECEIPT" <<'PY'
+import json, sys, time
+for _ in range(5):
+    try:
+        r = json.load(open(sys.argv[1], encoding="utf-8"))
+        print({"succeeded": 0, "failed": 1}.get(str(r.get("outcome", "")).lower(), 4))
+        break
+    except Exception:
+        time.sleep(2)
+else:
+    print(4)
+PY
+}
+
+pane_text() {  # $1=pane_id
+  "$OTTY_CLI" pane capture --pane "$1" --lines 200 2>/dev/null
+}
+
+# Visible screen with digits / spinner glyphs / punctuation stripped, hashed — timers and
+# spinners keep repainting, so raw bytes always change; real progress changes the words.
+pane_fingerprint() {  # $1=pane_id
+  pane_text "$1" | python3 -I -c '
+import hashlib, re, sys
+t = re.sub(r"[^A-Za-z一-鿿]", "", sys.stdin.read())
+print(hashlib.md5(t.encode()).hexdigest() if t else "")' 2>/dev/null
+}
+
+wait_done() {  # $1=pane_id (optional — enables stall detection)
+  local pane="${1:-}" waited=0 fp="" last_fp="" still=0
+  while [[ ! -f "$DONE" ]]; do
+    if [[ -s "$RECEIPT" ]]; then
+      # executor finished (either way); the pane stays open (by design, for inspection)
+      sleep 2   # let the capture flush its tail into FINAL
+      echo "INFO: receipt seen — pai job finished; pane left open for review" | tee -a "$FINAL" >&2
+      receipt_exit_code >"$DONE"
+      return 0
+    fi
+    if [[ -f "$EXITED" ]]; then
+      # executor process ended (dsh headless always does; claude only on crash / quit) — give a
+      # late receipt a moment, then report the missing receipt instead of the CLI's exit code
+      sleep 3
+      [[ -s "$RECEIPT" ]] && continue
+      echo "ERROR: executor exited (code $(cat "$EXITED")) without writing a receipt" | tee -a "$FINAL" >&2
+      echo "4" >"$DONE"
+      return 4
+    fi
+    if (( waited >= TIMEOUT_SEC )); then
+      echo "ERROR: timed out after ${TIMEOUT_SEC}s waiting for pai job" | tee -a "$FINAL" >&2
+      echo "124" >"$DONE"
+      return 124
+    fi
+    if [[ -n "$pane" ]] && (( waited % 15 == 0 )); then
+      fp="$(pane_fingerprint "$pane")"
+      if [[ -n "$fp" && "$fp" == "$last_fp" ]]; then still=$((still + 15)); else still=0; last_fp="$fp"; fi
+      if (( still >= STALL_SEC )); then
+        echo "WARN: pane $pane screen unchanged for ${still}s and no receipt — executor looks stalled" | tee -a "$FINAL" >&2
+        echo "----- last screen (pane $pane) -----" >&2
+        pane_text "$pane" | grep -v '^[[:space:]]*$' | tail -25 >&2 || true
+        echo "-----  still working? keep waiting: pai-run --wait $META  -----" >&2
+        echo "125" >"$DONE"
+        return 125
+      fi
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
+# Receipt + requested-vs-observed launch config, printed on every exit path
+report_job() {
+  python3 -I - "$RECEIPT" "$FINAL" "$META" <<'PY' || true
+import glob, json, os, re, subprocess, sys
+receipt_path, final_path, meta_path = sys.argv[1:4]
+meta = {}
+for line in open(meta_path, encoding="utf-8"):
+    k, _, v = line.rstrip("\n").partition("=")
+    meta.setdefault(k, v)
+try:
+    r = json.load(open(receipt_path, encoding="utf-8"))
+    files = r.get("files_modified") or []
+    print(f"RECEIPT_OUTCOME={r.get('outcome', '?')}")
+    print(f"RECEIPT_SUMMARY={' '.join(str(r.get('summary', '')).split())}")
+    print(f"RECEIPT_FILES={','.join(files) if isinstance(files, list) else files}")
+    vo = str(r.get("verification_output", "")).strip()
+    if vo:
+        print("----- receipt verification_output (executor's claim — rerun it yourself) -----")
+        print(vo[-3000:])
+        print("-----")
+except FileNotFoundError:
+    print("RECEIPT_OUTCOME=none")
+except Exception as e:
+    print(f"RECEIPT_OUTCOME=unreadable ({e})")
+
+print("REQUESTED " + " ".join(f"{k}={meta.get(k, '-')}" for k in ("harness", "cli_model", "effort", "context", "gateway")))
+
+# observed: what the CLI itself reports it launched with (best effort)
+obs = {}
+try:
+    t = open(final_path, "rb").read().decode("utf-8", "replace")
+except Exception:
+    t = ""
+if meta.get("harness") == "claude":
+    t = re.sub(r"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[78=>()P][0-9A-Za-z]?", "", t)
+    # Claude Code banner "<model> with <effort> effort" — either a hyphenated id (gateway models) or
+    # a display name like "Sonnet 5.5"; the spinner also says "thinking with high effort", so a bare
+    # word never matches. Take the most frequent (repaints garble some).
+    from collections import Counter
+    m = Counter(re.findall(r"((?:Opus|Sonnet|Haiku|Fable) [\d.]+(?: \(1M context\))?|[A-Za-z][\w.]*-[\w.-]*(?:\[\w+\])?) with (\w+) effort", t))
+    if m:
+        obs["model"], obs["effort"] = m.most_common(1)[0][0]
+    m = list(re.finditer(r"Auto-compact window: (\S+) tokens", t))
+    if m:
+        obs["context"] = m[-1].group(1)
+    # The fullscreen renderer often keeps the banner out of the capture; the session transcript
+    # (~/.claude/projects/<cwd with non-alnum → "-">/<id>.jsonl, the one quoting this job's
+    # receipt path) records the model of every reply
+    proj = re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(meta.get("cwd") or "."))
+    for f in sorted(glob.glob(os.path.expanduser(f"~/.claude/projects/{proj}/*.jsonl")), key=os.path.getmtime, reverse=True)[:10]:
+        try:
+            raw = open(f, encoding="utf-8", errors="replace").read()
+        except Exception:
+            continue
+        if receipt_path in raw:
+            models = sorted(set(re.findall(r'"model":"([^"<]+)"', raw)))
+            if models:
+                obs["model"] = ",".join(models)
+            break
+elif meta.get("harness") == "dsh":
+    # dsh --json stream starts with {"type":"session","sessionId":...}; the persisted session
+    # records the provider / model each LLM call actually used
+    sid = re.search(r'"sessionId":"(session-[^"]+)"', t)
+    if sid:
+        obs["session"] = sid.group(1)
+        files = glob.glob(os.path.expanduser(f"~/.dsh/sessions/*/{sid.group(1)}/session.*.jsonl*"))
+        if files:
+            try:
+                f = files[0]
+                raw = subprocess.run(["zstd", "-dc", f], capture_output=True, timeout=30).stdout if f.endswith(".zstd") else open(f, "rb").read()
+                raw = raw.decode("utf-8", "replace")
+                pairs = set(re.findall(r'"provider":"([^"]+)","model":"([^"]+)"', raw)) | \
+                        {(b, a) for a, b in re.findall(r'"model":"([^"]+)","provider":"([^"]+)"', raw)}
+                if pairs:
+                    obs["model"] = ",".join(sorted(f"{p}/{m}" for p, m in pairs))
+            except Exception:
+                pass
+print("OBSERVED " + (" ".join(f"{k}={v}" for k, v in obs.items()) if obs else "(not reported by CLI)"))
+PY
+}
+
+if [[ -n "${WAIT_META:-}" ]]; then
+  # Resume waiting on an existing job (e.g. after a stall warning that turned out to be a long think)
+  [[ -f "$WAIT_META" ]] || { echo "ERROR: --wait needs an existing .meta file" >&2; exit 2; }
+  META="$WAIT_META"
+  meta_get() { grep -m1 "^$1=" "$META" | cut -d= -f2-; }
+  FINAL="$(meta_get final)"; DONE="$(meta_get done)"; RECEIPT="$(meta_get receipt)"; EXITED="$(meta_get exited)"
+  pane="$(meta_get pane_id)"
+  rm -f "$DONE"
+  wait_done "$pane" || true
+  ec="$(cat "$DONE" 2>/dev/null || echo 1)"
+  report_job
+  echo "FINAL_FILE=$FINAL"
+  echo "PANE_ID=$pane"
+  echo "META=$META"
+  exit "$ec"
+fi
+
+if [[ -z "$SPEC" || ! -f "$SPEC" ]]; then
+  echo "ERROR: --spec must point to an existing prompt file" >&2
+  exit 2
+fi
+
+JOBS_DIR="${PAI_JOBS_DIR:-/tmp/pai-jobs}"
+mkdir -p "$JOBS_DIR"
+STAMP="$(date +%Y%m%d-%H%M%S)-$$"
+HARNESS_CONF="$JOBS_DIR/$STAMP.harness-conf.json"
+KEY_FILE="$JOBS_DIR/$STAMP.key"
+
+# Resolve model alias → harness + CLI model id + per-job harness config:
+#   claude → --settings file (gateway / context window overrides)
+#   dsh    → --patch overlay (provider / default model); api key via a 0600 file the runner
+#            reads into api_key_env and deletes, so it never lands in argv or the patch file
+PAI_MODELS_JSON="${PAI_MODELS_JSON:-$HOME/.claude/skills/pai/models.json}"
+if [[ ! -f "$PAI_MODELS_JSON" ]]; then
+  echo "ERROR: models config not found: $PAI_MODELS_JSON" >&2
+  exit 2
+fi
+RESOLVED="$(python3 -I - "$PAI_MODELS_JSON" "$MODEL_ALIAS" "$HARNESS_CONF" "$KEY_FILE" <<'PY'
+import json, os, re, sys
+cfg_path, alias, conf_path, key_path = sys.argv[1:5]
+cfg = json.load(open(cfg_path, encoding="utf-8"))
+models = {k: m for k, m in cfg["models"].items() if not m.get("disabled")}
+alias = alias or cfg["default"]
+if alias not in models:
+    state = "disabled" if alias in cfg["models"] else "unknown"
+    sys.exit(f"ERROR: {state} model alias '{alias}' (available: {', '.join(models)})")
+
+def write_private(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+
+m = models[alias]
+harness = m.get("harness", "claude")
+if harness not in ("claude", "dsh"):
+    sys.exit(f"ERROR: model alias '{alias}' has unsupported harness '{harness}' (only claude / dsh)")
+# key: the api_key field, else the env var named by "api_key_env" (keeps keys out of the file)
+api_key = m.get("api_key") or (os.environ.get(m["api_key_env"], "") if m.get("api_key_env") else "")
+conf = None
+key_env = "-"
+if harness == "claude" and m.get("base_url") and not api_key:
+    hint = f" or export {m['api_key_env']}" if m.get("api_key_env") else ""
+    sys.exit(f"ERROR: model alias '{alias}' needs a key: fill api_key in {cfg_path}{hint}")
+if harness == "claude" and (m.get("base_url") or m.get("context")):
+    # ~/.claude/settings.json pins its own gateway in "env", which beats process env —
+    # only a higher-priority --settings layer can redirect Claude Code. Every model tier
+    # (incl. haiku background calls / subagents) points at the gateway model.
+    env = {}
+    if m.get("base_url"):
+        env = {"ANTHROPIC_BASE_URL": m["base_url"], "ANTHROPIC_AUTH_TOKEN": api_key, "ANTHROPIC_MODEL": m["model"]}
+        for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):
+            env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"] = m["model"]
+            env[f"ANTHROPIC_DEFAULT_{tier}_MODEL_NAME"] = m["model"]
+    if m.get("extra_headers"):
+        env["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join(f"{k}: {v}" for k, v in m["extra_headers"].items())
+    if m.get("context"):
+        # unrecognized model ids otherwise get an assumed (small) window and compact early
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(int(m["context"]))
+    conf = {"env": env}
+elif harness == "dsh":
+    # a dsh patch is a YAML array of loader entries; JSON is valid YAML
+    provider_conf = {}
+    if m.get("api_key_env"):
+        provider_conf["apiKeyEnv"] = m["api_key_env"]
+        if api_key:
+            write_private(key_path, api_key)
+            key_env = m["api_key_env"]
+    conf = [
+        {"id": "agent-default-model", "config": {"provider": m["provider"], "model": m["model"]}},
+        {"id": "llm-pi-ai", "config": {"providers": {m["provider"]: provider_conf}}},
+    ]
+if conf is not None:
+    write_private(conf_path, json.dumps(conf, ensure_ascii=False, indent=2))
+cli_model = f"{m['provider']}/{m['model']}" if harness == "dsh" else m["model"]
+effort = m.get("effort") or ("high" if harness == "claude" else "-")   # claude: high, not xhigh
+context = str(m["context"]) if m.get("context") else "-"
+gateway = re.sub(r"^https?://([^/]+).*$", r"\1", m["base_url"]) if m.get("base_url") else (m.get("provider") or "-")
+# tab-separated: "bin" may contain spaces (/Applications/DeepSeek Harness.app/…)
+print("\t".join([alias, harness, cli_model, conf_path if conf is not None else "-", m.get("bin") or "-",
+                 effort, context, gateway, m.get("profile") or "headless", key_env]))
+PY
+)"
+IFS=$'\t' read -r MODEL_ALIAS HARNESS MODEL HARNESS_CONF HARNESS_BIN EFFORT CONTEXT GATEWAY DSH_PROFILE KEY_ENV <<<"$RESOLVED"
+
+# CLI binary: models.json "bin" wins, else PATH lookup.
+# Absolute path either way, since nvm / custom PATH may be missing in a fresh pane.
+if [[ "$HARNESS_BIN" == "-" ]]; then
+  HARNESS_BIN="$(command -v "$HARNESS" || true)"
+fi
+if [[ -z "$HARNESS_BIN" || ! -x "$HARNESS_BIN" ]]; then
+  echo "ERROR: $HARNESS CLI not found (${HARNESS_BIN:-not on PATH})" >&2
+  exit 127
+fi
+
+if [[ -z "$FINAL" ]]; then
+  FINAL="/tmp/pai-final-$$.txt"
+fi
+DONE="$JOBS_DIR/$STAMP.done"
+EXITED="$JOBS_DIR/$STAMP.exited"
+RUNNER="$JOBS_DIR/$STAMP.run.sh"
+VIEWER="$JOBS_DIR/$STAMP.view.py"
+META="$JOBS_DIR/$STAMP.meta"
+RECEIPT="$JOBS_DIR/$STAMP.receipt.json"
+SPEC_RUN="$JOBS_DIR/$STAMP.spec"
+PANE_STATE="$JOBS_DIR/last-split-pane"
+: >"$FINAL"
+rm -f "$DONE" "$EXITED" "$RECEIPT"
+
+# The TUI never auto-exits after finishing a turn, so the spec carries a completion contract:
+# the executor writes a receipt JSON as its last step — on success AND on failure — and the
+# waiter treats it as done (the pane is left open for inspection / follow-up questions).
+cat "$SPEC" >"$SPEC_RUN"
+cat >>"$SPEC_RUN" <<EOF
+
+---
+【自动化完成回执 · 必须执行 · 不可省略】
+结束时（无论成功、失败、做不下去还是放弃）**必须且只能写一次**回执文件：
+$RECEIPT
+内容是一个 JSON 对象，四个字段：
+{"outcome": "succeeded 或 failed", "summary": "一两句：做了什么 / 卡在哪 / 还剩什么", "files_modified": ["改过的文件路径"], "verification_output": "Verification 命令的实际输出原文（没跑成就写原因）"}
+- 全部做完且 Verification 符合期望 → "succeeded"；否则一律 "failed"，不要为了交差写 succeeded
+- 遇到做不下去的情况，别停在那里等人，直接写 failed 回执说明原因
+- 回执是本任务的最后一步：写完立即停止，不要做任何额外调查、解释、收尾或"通知调用方"的动作 —— 回执本身就是唯一的完成通知
+EOF
+
+if [[ -z "$TITLE" ]]; then
+  TITLE="pai · $MODEL_ALIAS · $(basename "$CWD") · $STAMP"
+fi
+
+# Interactive TUI takes the prompt as argv (ARG_MAX ~256KB on macOS, keep headroom); huge specs
+# run Claude Code in print mode instead. dsh reads the spec from stdin, so it has no limit.
+SPEC_BYTES=$(wc -c <"$SPEC_RUN" | tr -d ' ')
+MAX_INTERACTIVE_SPEC=180000
+MODE="tui"
+if [[ "$HARNESS" == "dsh" ]]; then
+  MODE="stream"
+elif (( SPEC_BYTES > MAX_INTERACTIVE_SPEC )); then
+  echo "WARN: spec is ${SPEC_BYTES}B (>${MAX_INTERACTIVE_SPEC}); interactive TUI argv too large — print mode" | tee -a "$FINAL" >&2
+  MODE="print"
+fi
+
+# Renders dsh's --json event stream for the human in the pane; raw events go to FINAL.
+cat >"$VIEWER" <<'PY'
+import json, sys
+raw = open(sys.argv[1], "a", encoding="utf-8")
+DIM, BOLD, CYAN, GREEN, RED, RESET = "\033[2m", "\033[1m", "\033[36m", "\033[32m", "\033[31m", "\033[0m"
+def clip(s, n):
+    s = str(s).rstrip()
+    return s if len(s) <= n else s[:n] + " …"
+for line in sys.stdin:
+    raw.write(line); raw.flush()
+    try:
+        e = json.loads(line)
+    except Exception:
+        print(line, end="", flush=True); continue
+    t = e.get("type")
+    if t == "session":
+        print(f"{DIM}session {e.get('sessionId')}  ·  {e.get('cwd')}{RESET}")
+    elif t == "tool_call":
+        inp = e.get("input") or {}
+        arg = inp.get("command") or inp.get("path") or inp.get("file_path") or inp.get("pattern") or json.dumps(inp, ensure_ascii=False)
+        print(f"\n{CYAN}⏺ {e.get('tool')}{RESET} {clip(arg, 300)}")
+        if inp.get("description"):
+            print(f"  {DIM}{clip(inp['description'], 200)}{RESET}")
+    elif t == "tool_result":
+        ok = e.get("status") == "completed"
+        res = e.get("result")
+        res = res if isinstance(res, str) else json.dumps(res, ensure_ascii=False)
+        lines = (res or "").strip().splitlines()
+        head = "\n    ".join(clip(l, 200) for l in lines[:6])
+        more = f"\n    {DIM}… +{len(lines) - 6} lines{RESET}" if len(lines) > 6 else ""
+        print(f"  {GREEN if ok else RED}⎿{RESET} {head}{more}")
+    elif t == "text":
+        print(f"\n{e.get('text', '')}")
+    elif t == "status":
+        ph = e.get("phase")
+        if ph == "turn_end":
+            print(f"\n{DIM}turn end · {json.dumps(e.get('reason'), ensure_ascii=False)}{RESET}")
+        elif ph == "step_end" and e.get("usage"):
+            u = e["usage"]
+            print(f"{DIM}  · tokens in {u.get('inputTokens')} out {u.get('outputTokens')} total {u.get('totalTokens')}{RESET}")
+    elif t == "final":
+        print(f"\n{BOLD}──── final ────{RESET}\n{e.get('text', '')}")
+    else:
+        print(f"{DIM}[{t}] {clip(json.dumps(e, ensure_ascii=False), 300)}{RESET}")
+    sys.stdout.flush()
+PY
+
+# Runner, typed into the new Otty pane's shell (the pane outlives it, left open for review).
+cat >"$RUNNER" <<EOF
+#!/usr/bin/env bash
+set -uo pipefail
+printf '\\033]0;%s\\007' $(printf %q "$TITLE")
+echo "=== pai-run ==="
+echo "title: $(printf %q "$TITLE")"
+echo "cwd:   $(printf %q "$CWD")"
+echo "spec:  $(printf %q "$SPEC")"
+echo "model: $(printf %q "$MODEL_ALIAS") → $(printf %q "$HARNESS") · $(printf %q "$MODEL")"
+echo "final: $(printf %q "$FINAL")"
+echo "mode:  $MODE"
+echo "started: \$(date -Iseconds)"
+echo "===================="
+echo ""
+cd $(printf %q "$CWD") || { echo 1 >$(printf %q "$EXITED"); exit 1; }
+export PATH="\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH"
+BIN=$(printf %q "$HARNESS_BIN")
+CONF=$(printf %q "$HARNESS_CONF")
+SPEC_RUN=$(printf %q "$SPEC_RUN")
+FINAL=$(printf %q "$FINAL")
+if [[ $(printf %q "$HARNESS") == "claude" ]]; then
+  # Fresh top-level Claude Code session: drop any inherited Claude Code env (nested-session guard,
+  # messaging socket, session id) so it doesn't attach to / get mistaken for the architect.
+  unset CLAUDECODE \$(compgen -e | grep '^CLAUDE_')
+  # Without it Claude Code asks "try fullscreen renderer?" and restarts, dropping the initial prompt.
+  export CLAUDE_CODE_NO_FLICKER=1
+  TUI_CMD=("\$BIN" --model $(printf %q "$MODEL") --effort $(printf %q "$EFFORT") --dangerously-skip-permissions)
+  [[ "\$CONF" != "-" ]] && TUI_CMD+=(--settings "\$CONF")
+  if [[ "$MODE" == "tui" ]]; then
+    # Interactive TUI captured via script(1) so the tty stays real; the prompt is the initial
+    # input (not -p) so the session stays interactive.
+    script -q "\$FINAL" "\${TUI_CMD[@]}" "\$(cat "\$SPEC_RUN")"
+    ec=\$?
+  else
+    "\${TUI_CMD[@]}" -p "\$(cat "\$SPEC_RUN")" 2>&1 | tee "\$FINAL"
+    ec=\${PIPESTATUS[0]}
+  fi
+else
+  KEY_FILE=$(printf %q "$KEY_FILE")
+  if [[ $(printf %q "$KEY_ENV") != "-" && -f "\$KEY_FILE" ]]; then
+    export $(printf %q "$KEY_ENV")="\$(cat "\$KEY_FILE")"
+    rm -f "\$KEY_FILE"
+  fi
+  "\$BIN" --profile $(printf %q "$DSH_PROFILE") --patch "\$CONF" --json - <"\$SPEC_RUN" 2>&1 \\
+    | python3 -I -u $(printf %q "$VIEWER") "\$FINAL"
+  ec=\${PIPESTATUS[0]}
+fi
+echo "" | tee -a "\$FINAL"
+echo "==== finished exit=\$ec \$(date -Iseconds) ====" | tee -a "\$FINAL"
+echo "\$ec" >$(printf %q "$EXITED")
+EOF
+chmod +x "$RUNNER"
+
+{
+  echo "stamp=$STAMP"
+  echo "spec=$SPEC"
+  echo "cwd=$CWD"
+  echo "model=$MODEL_ALIAS"
+  echo "harness=$HARNESS"
+  echo "harness_bin=$HARNESS_BIN"
+  echo "cli_model=$MODEL"
+  echo "effort=$EFFORT"
+  echo "context=$CONTEXT"
+  echo "gateway=$GATEWAY"
+  echo "final=$FINAL"
+  echo "done=$DONE"
+  echo "exited=$EXITED"
+  echo "runner=$RUNNER"
+  echo "title=$TITLE"
+  echo "spec_bytes=$SPEC_BYTES"
+  echo "receipt=$RECEIPT"
+  echo "spec_run=$SPEC_RUN"
+} >"$META"
+
+no_visible_pane() {
+  rm -f "$KEY_FILE"
+  echo "ERROR: $1 — pai-run 只在 Otty 里跑（需要 OTTY_PANE_ID 和 Otty 控制 socket）" | tee -a "$FINAL" >&2
+  echo "FINAL_FILE=$FINAL"
+  echo "VISIBLE_TAB=0"
+  echo "META=$META"
+  exit 3
+}
+
+[[ -n "${OTTY_PANE_ID:-}" ]] || no_visible_pane "not inside an Otty pane"
+[[ -x "$OTTY_CLI" ]] || no_visible_pane "otty CLI not found: $OTTY_CLI"
+
+MY_PANE="p_${OTTY_PANE_ID#p_}"
+MY_TAB="$("$OTTY_CLI" --json pane show --pane "$MY_PANE" 2>/dev/null | python3 -I -c '
+import json, sys
+print(json.load(sys.stdin)["data"]["tab_id"])' 2>/dev/null || true)"
+[[ -n "$MY_TAB" ]] || no_visible_pane "Otty control socket unreachable for pane $MY_PANE"
+
+# Close the previous job's pane wherever it lives. Otty's pane list has no geometry, so the
+# user's own panes are never closed; other panes in this tab only get a warning.
+OLD_PANE="$(cat "$PANE_STATE" 2>/dev/null || true)"
+if [[ "$OLD_PANE" == p_* && "$OLD_PANE" != "$MY_PANE" ]] && "$OTTY_CLI" pane show --pane "$OLD_PANE" >/dev/null 2>&1; then
+  echo "INFO: closing previous job pane $OLD_PANE" | tee -a "$FINAL" >&2
+  "$OTTY_CLI" -y pane close --pane "$OLD_PANE" --force >/dev/null 2>>"$JOBS_DIR/$STAMP.otty-cli.log" || true
+  sleep 0.3
+fi
+rm -f "$PANE_STATE"
+
+OTHERS="$("$OTTY_CLI" --json pane list --tab "$MY_TAB" 2>/dev/null | python3 -I -c '
+import json, sys
+for p in json.load(sys.stdin).get("data", []):
+    print(p["id"])' 2>/dev/null | grep -v -x "$MY_PANE" || true)"
+if [[ -n "$OTHERS" ]]; then
+  echo "WARN: tab $MY_TAB has other panes ($(echo $OTHERS)); not closing them — split may be uneven" | tee -a "$FINAL" >&2
+fi
+
+echo "INFO: splitting right of Otty pane $MY_PANE (mode=$MODE)" | tee -a "$FINAL" >&2
+NEW_PANE="$("$OTTY_CLI" --json pane split --pane "$MY_PANE" --direction right \
+    --size "${PAI_SPLIT_PERCENT:-50}" --cwd "$CWD" --no-focus --title "$TITLE" \
+    --command "$(printf %q "$RUNNER")" \
+    2>>"$JOBS_DIR/$STAMP.otty-cli.log" | python3 -I -c '
+import json, sys
+print(json.load(sys.stdin)["data"]["id"])' 2>/dev/null || true)"
+if [[ -z "$NEW_PANE" ]]; then
+  tail -5 "$JOBS_DIR/$STAMP.otty-cli.log" 2>/dev/null | tee -a "$FINAL" >&2 || true
+  no_visible_pane "otty pane split failed"
+fi
+
+echo "INFO: $MODEL_ALIAS 跑在右侧 Otty pane $NEW_PANE — $TITLE" | tee -a "$FINAL" >&2
+echo "$NEW_PANE" >"$PANE_STATE"
+echo "pane_id=$NEW_PANE" >>"$META"
+wait_done "$NEW_PANE" || true
+ec="$(cat "$DONE" 2>/dev/null || echo 1)"
+report_job
+echo "FINAL_FILE=$FINAL"
+echo "VISIBLE_TAB=1"
+echo "MODE=$MODE"
+echo "LAYOUT=otty-split"
+echo "PANE_ID=$NEW_PANE"
+echo "META=$META"
+exit "$ec"

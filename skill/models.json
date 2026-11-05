@@ -1,0 +1,38 @@
+{
+  "default": "deepseek",
+  "models": {
+    "deepseek": {
+      "name": "DeepSeek V4.1 Flash (Claude Code · opencode go)",
+      "harness": "claude",
+      "model": "deepseek-v4.1-flash",
+      "context": 1000000,
+      "base_url": "https://opencode.ai/inference/go",
+      "api_key": "",
+      "extra_headers": {
+        "User-Agent": "pai-run/1.0",
+        "x-opencode-session": "pai-run"
+      },
+      "note": "Claude Code 外壳走 opencode go 网关的 Anthropic /v1/messages（base_url 不带 /v1）；key 填 api_key 或 export OPENCODE_GO_API_KEY；付费模型，并行别超 8 路",
+      "api_key_env": "OPENCODE_GO_API_KEY"
+    },
+    "deepseek-dsh": {
+      "name": "DeepSeek V4.1 Flash (DeepSeek Harness · opencode go)",
+      "harness": "dsh",
+      "bin": "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+      "profile": "headless",
+      "provider": "opencode-go",
+      "model": "deepseek-v4.1-flash",
+      "context": 1000000,
+      "api_key": "",
+      "api_key_env": "OPENCODE_GO_API_KEY",
+      "note": "dsh 外壳（DeepSeek Harness 的 headless profile，无 TUI，右侧显示 --json 事件流）；每单经 --patch 注入 provider / model；key 填 api_key 或 export OPENCODE_GO_API_KEY"
+    },
+    "sonnet": {
+      "name": "Claude Sonnet 5.5 1M (Claude Code)",
+      "harness": "claude",
+      "model": "claude-sonnet-5-5[1m]",
+      "context": 1000000,
+      "note": "Claude Code 本体（自己的登录态 / 网关），1M 上下文：模型名带 [1m] 让 CC 按 1M 识别"
+    }
+  }
+}

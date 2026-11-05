@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# paimodel — 列出 pai 的执行方模型（models.json 里未 disabled 的条目），可选一个设为 pai-run 不传 --model 时的默认
+#
+# 用法：paimodel        带编号列出模型（* = 当前默认），输编号回车即写进 pai models.json 的 default；直接回车不改
+#       paimodel -q     只输出当前默认别名
+# opencode-free 具体跑哪个免费型号另由 ocfree（pai-f）切换。
+
+set -euo pipefail
+
+PAI_MODELS_JSON="${PAI_MODELS_JSON:-$HOME/.claude/skills/pai/models.json}"
+
+[[ -f "$PAI_MODELS_JSON" ]] || { echo "paimodel: 找不到 ${PAI_MODELS_JSON}" >&2; exit 1; }
+
+current=$(jq -r '.default // ""' "$PAI_MODELS_JSON")
+
+if [[ "${1:-}" == "-q" ]]; then
+  echo "$current"
+  exit 0
+fi
+
+# 每行：别名 \t 外壳 \t 模型 \t 上下文(K) \t 名称
+rows=$(jq -r '.models | to_entries[]
+  | select(.value.disabled != true)
+  | [.key, (.value.harness // "claude"), .value.model, ((.value.context // 0) / 1000 | floor | tostring) + "K", .value.name]
+  | @tsv' "$PAI_MODELS_JSON")
+
+{
+  printf '编号\t别名\t外壳\t模型\t上下文\t名称\n'
+  awk -F'\t' -v cur="$current" '{ printf "%d%s\t%s\t%s\t%s\t%s\t%s\n", NR, ($1 == cur ? "*" : ""), $1, $2, $3, $4, $5 }' <<<"$rows"
+} | column -t -s $'\t'
+
+# 非终端（管道 / 脚本里调用）只列不问
+[[ -t 0 ]] || exit 0
+
+n=$(wc -l <<<"$rows" | tr -d ' ')
+echo
+read -r -p "选编号设为 pai 默认模型（* 为当前，直接回车不改）: " pick
+[[ -z "$pick" ]] && exit 0
+if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > n )); then
+  echo "paimodel: 编号无效（1-${n}）" >&2
+  exit 1
+fi
+
+alias=$(sed -n "${pick}p" <<<"$rows" | cut -f1)
+tmp=$(mktemp)
+jq --arg a "$alias" '.default = $a' "$PAI_MODELS_JSON" >"$tmp" && cat "$tmp" >"$PAI_MODELS_JSON"
+rm -f "$tmp"
+echo "已更新 pai 默认模型 → ${alias}"
