@@ -120,7 +120,7 @@ pai-run --wait /tmp/pai-jobs/<stamp>.meta   # 疑似卡死后续等同一单
 ## 分屏行为
 
 - 在当前 Otty pane 右侧切 50/50（`PAI_SPLIT_PERCENT` 可调），焦点留左边
-- 每次派活先关掉上一单的 pai pane；**不碰你自己开的 pane**（同 tab 还有别的 pane 时只告警）
+- 每次派活只关掉**本会话派出的**上一单 pai pane（按派活方 pane 分开记录），其他会话正在跑的 pai pane 不受影响，多个会话可以同时派活；**不碰你自己开的 pane**（同 tab 还有别的 pane 时只告警）
 - 干完右侧 pane 留着供翻看；完成靠回执文件判断，不等进程退出
 
 ## License

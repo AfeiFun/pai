@@ -79,7 +79,7 @@ pai-run --spec /tmp/spec-<短名>.md --cwd <工作目录>
 ## 分屏行为（脚本全自动，你不用管）
 
 - 只支持 Otty：用 `otty pane split --direction right --no-focus` 在当前 pane 右侧切 50/50（`LAYOUT=otty-split`，`PANE_ID` 形如 `p_xxx`），焦点留左边
-- 派活前先关掉上一单的 pai pane；Otty 的 pane 列表没有坐标，**不碰用户自己的 pane**（同 tab 还有别的 pane 时只告警，分屏可能不均）
+- 派活前只关掉**本会话（当前 pane）派出的**上一单 pai pane——记录按派活方 pane 分开存（`/tmp/pai-jobs/last-split-pane.<pane_id>`），别的会话正在跑的 pai pane 不会被关，多个会话可以同时派活；Otty 的 pane 列表没有坐标，**不碰用户自己的 pane**（同 tab 还有别的 pane 时只告警，分屏可能不均）
 - 干完右侧 pane 留着供翻看（Claude Code 外壳的 deepseek / sonnet 还能追问）；完成靠回执文件——**不要自己发明轮询或等进程退出**（续等用 `pai-run --wait <META>`）
 - 若执行方 CLI 弹出首次目录信任确认（cwd 是没信任过的目录时会出现），`otty pane capture --pane <p_id> --lines 60` 抓画面看选项，再 `otty pane send-text --pane <p_id> '<按键>'`（回车写 `\r`）处置
 

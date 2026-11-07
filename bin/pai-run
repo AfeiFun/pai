@@ -333,7 +333,8 @@ VIEWER="$JOBS_DIR/$STAMP.view.py"
 META="$JOBS_DIR/$STAMP.meta"
 RECEIPT="$JOBS_DIR/$STAMP.receipt.json"
 SPEC_RUN="$JOBS_DIR/$STAMP.spec"
-PANE_STATE="$JOBS_DIR/last-split-pane"
+# Pre-fix versions kept one global previous-pane record shared by every session; drop it.
+rm -f "$JOBS_DIR/last-split-pane"
 : >"$FINAL"
 rm -f "$DONE" "$EXITED" "$RECEIPT"
 
@@ -510,8 +511,12 @@ import json, sys
 print(json.load(sys.stdin)["data"]["tab_id"])' 2>/dev/null || true)"
 [[ -n "$MY_TAB" ]] || no_visible_pane "Otty control socket unreachable for pane $MY_PANE"
 
-# Close the previous job's pane wherever it lives. Otty's pane list has no geometry, so the
-# user's own panes are never closed; other panes in this tab only get a warning.
+# The previous-pane record is per dispatcher pane: each architect session only ever closes the
+# job pane it opened itself, never a job another session (another Otty pane) is running.
+PANE_STATE="$JOBS_DIR/last-split-pane.$MY_PANE"
+
+# Close this dispatcher's previous job pane wherever it lives. Otty's pane list has no geometry,
+# so the user's own panes are never closed; other panes in this tab only get a warning.
 OLD_PANE="$(cat "$PANE_STATE" 2>/dev/null || true)"
 if [[ "$OLD_PANE" == p_* && "$OLD_PANE" != "$MY_PANE" ]] && "$OTTY_CLI" pane show --pane "$OLD_PANE" >/dev/null 2>&1; then
   echo "INFO: closing previous job pane $OLD_PANE" | tee -a "$FINAL" >&2
